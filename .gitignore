@@ -1,0 +1,10 @@
+# rechunk.sh output (see README "Building base OS Image")
+/rechunk/
+
+# image-builder output
+/images/
+
+# local age keys and decrypted scratch files
+*.agekey
+keys.txt
+agent-config.yaml

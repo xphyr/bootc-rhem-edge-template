@@ -1,0 +1,7 @@
+apiVersion: flightctl.io/v1beta1
+kind: Repository
+metadata:
+  name: bootc-edge-fleet
+spec:
+  url: https://git.example.com/example/bootc-edge-fleet
+  type: git

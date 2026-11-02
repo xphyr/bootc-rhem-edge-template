@@ -1,0 +1,6 @@
+# Restart the service when its config changes (a trailing slash matches anything under a directory)
+- if:
+  - path: /etc/traefik/traefik.yaml
+    op: [created, updated]
+  run: /usr/bin/systemctl restart traefik*.service
+  timeout: 120s

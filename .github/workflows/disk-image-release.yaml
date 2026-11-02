@@ -1,0 +1,154 @@
+# .github/workflows/disk-image-release.yaml
+#
+# Runs on GitHub Actions and Gitea Actions (Gitea also reads .github/workflows).
+# Jobs need a self-hosted runner with the labels shown in runs-on; see
+# "Running on GitHub" in the README for GitHub-hosted runners.
+#
+# Builds a KubeVirt/CDI "containerDisk" from the base bootc image:
+#   bootc image (amd64) --image-builder (privileged container)--> qcow2
+#   --> FROM scratch, /disk/disk.qcow2
+# and pushes it as  $REGISTRY/$DISK_IMAGE:<release>  and  :latest.
+#
+# Trigger: runs when fleet-bot rolls a new release to the canary fleet, which only
+# happens after base-image-release built and pushed successfully. It is idempotent:
+# if the disk image for that release already exists, it does nothing.
+# Can also be run manually, optionally with an explicit bootc image reference.
+#
+# Runner requirements (labels self-hosted + bootc-disk): passwordless `sudo podman` for the runner
+# user, plus qemu-img and skopeo. See docs.
+
+name: disk-image-release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'fleets/definitions/monitoring-stack.yaml'
+      - 'bootc/disk-blueprint.toml'
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'bootc image to convert (default: the image in the canary fleet)'
+        required: false
+        default: ''
+      force:
+        description: 'Rebuild even if the disk image already exists (true/false)'
+        required: false
+        default: 'false'
+
+env:
+  REGISTRY: registry.example.com          # <-- your registry
+  DISK_IMAGE: bootc/fedora44-edge-base-disk
+  CANARY_FLEET: fleets/definitions/monitoring-stack.yaml
+  BLUEPRINT: bootc/disk-blueprint.toml
+  IMAGE_BUILDER: ghcr.io/osbuild/image-builder-cli:latest
+  ROOTFS: xfs                               # Fedora bootc images don't declare a root filesystem
+
+jobs:
+  disk:
+    # Needs passwordless `sudo podman` (GitHub-hosted ubuntu-24.04 runners have it).
+    runs-on: [self-hosted, bootc-disk]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve source image and release tag
+        id: src
+        env:
+          INPUT_IMAGE: ${{ inputs.image }}
+        run: |
+          if [ -n "${INPUT_IMAGE:-}" ]; then
+            SRC="$INPUT_IMAGE"
+          else
+            SRC=$(yq 'select(.kind == "Fleet") | .spec.template.spec.os.image' "$CANARY_FLEET")
+          fi
+          [ -n "$SRC" ] && [ "$SRC" != "null" ] || { echo "No source image found"; exit 1; }
+          TAG="${SRC##*:}"
+          [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Could not derive a tag from $SRC"; exit 1; }
+          echo "Source: $SRC"
+          echo "Target: $REGISTRY/$DISK_IMAGE:$TAG"
+          echo "src=$SRC"  >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"  >> "$GITHUB_OUTPUT"
+          echo "dest=$REGISTRY/$DISK_IMAGE:$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Registry login
+        run: |
+          echo "${{ secrets.REGISTRY_PASSWORD }}" | \
+            podman login "$REGISTRY" -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+
+      - name: Skip if this release already has a disk image
+        id: check
+        run: |
+          if [ "${{ inputs.force }}" != "true" ] && \
+             skopeo inspect --raw "docker://${{ steps.src.outputs.dest }}" >/dev/null 2>&1; then
+            echo "Disk image ${{ steps.src.outputs.dest }} already exists; nothing to do."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pull source image into root container storage
+        if: steps.check.outputs.exists != 'true'
+        run: |
+          # image-builder reads --bootc-ref from root's container storage, so pull it there,
+          # reusing the credentials from the (rootless) login above.
+          sudo podman pull --platform linux/amd64 \
+            --authfile "$XDG_RUNTIME_DIR/containers/auth.json" \
+            "${{ steps.src.outputs.src }}"
+
+      - name: Build qcow2 with image-builder
+        if: steps.check.outputs.exists != 'true'
+        run: |
+          rm -rf ib-output && mkdir ib-output
+          sudo podman run --rm --privileged --pull=newer \
+            --security-opt label=type:unconfined_t \
+            -v "$PWD/$BLUEPRINT":/blueprint.toml:ro \
+            -v "$PWD/ib-output":/output \
+            -v /var/lib/containers/storage:/var/lib/containers/storage \
+            "$IMAGE_BUILDER" \
+            build \
+            --blueprint /blueprint.toml \
+            --output-dir /output \
+            --output-name disk \
+            --bootc-ref "${{ steps.src.outputs.src }}" \
+            --bootc-default-fs "$ROOTFS" \
+            qcow2
+          # Output is written as root; hand it back to the runner user.
+          sudo podman run --rm --entrypoint chown \
+            --security-opt label=type:unconfined_t \
+            -v "$PWD/ib-output":/output \
+            "$IMAGE_BUILDER" -R "$(id -u):$(id -g)" /output
+          ls -lhR ib-output
+
+      - name: Package as containerDisk
+        if: steps.check.outputs.exists != 'true'
+        run: |
+          QCOW=$(find ib-output -type f -name '*.qcow2' | head -n1)
+          [ -n "$QCOW" ] || { echo "No qcow2 produced"; exit 1; }
+          rm -rf disk-ctx && mkdir disk-ctx
+          # Compress the qcow2 (often halves the size) - registry push and CDI import get faster
+          qemu-img convert -c -O qcow2 "$QCOW" disk-ctx/disk.qcow2
+          qemu-img info disk-ctx/disk.qcow2
+          cat > disk-ctx/Containerfile <<'CF'
+          FROM scratch
+          ADD --chown=107:107 disk.qcow2 /disk/
+          CF
+          podman build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=${{ steps.src.outputs.src }}" \
+            -t "${{ steps.src.outputs.dest }}" disk-ctx/
+
+      - name: Push
+        if: steps.check.outputs.exists != 'true'
+        run: |
+          DEST="${{ steps.src.outputs.dest }}"
+          LATEST="$REGISTRY/$DISK_IMAGE:latest"
+          podman push "$DEST"
+          podman tag "$DEST" "$LATEST"
+          podman push "$LATEST"
+
+      - name: Clean up
+        if: always()
+        run: |
+          rm -rf ib-output disk-ctx
+          podman rmi -i "${{ steps.src.outputs.dest }}" "$REGISTRY/$DISK_IMAGE:latest" || true
+          sudo podman rmi -i "${{ steps.src.outputs.src }}" || true
+          podman logout --all || true

@@ -1,0 +1,6 @@
+# Restart the service when its config changes (a trailing slash matches anything under a directory)
+- if:
+  - path: /etc/alloy/conf.d/
+    op: [created, updated, removed]
+  run: /usr/bin/systemctl restart alloy.service
+  timeout: 30s

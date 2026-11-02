@@ -1,0 +1,146 @@
+# .github/workflows/base-image-release.yaml
+#
+# Runs on GitHub Actions and Gitea Actions (Gitea also reads .github/workflows).
+# Jobs need a self-hosted runner with the labels shown in runs-on; see
+# "Running on GitHub" in the README for GitHub-hosted runners.
+#
+# Builds the shared bootc base image for amd64 and Raspberry Pi 4 (arm64),
+# publishes both under ONE multi-arch tag, then rolls it to the canary fleet only.
+# Promote to the remaining fleets with promote-base-image.yaml.
+#
+# Trigger: bump bootc/RELEASE (e.g. "2026.11.2") and push, or run manually.
+#
+# Test releases: a RELEASE containing "-test" (e.g. "2026.11-test1") is built and
+# pushed, but the canary fleet is NOT updated, so no device changes and
+# disk-image-release does not run.
+
+name: base-image-release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bootc/RELEASE'
+      - 'bootc/Containerfile'
+      - 'bootc/rechunk.sh'
+      - 'bootc/user-data.sops.yaml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: registry.example.com        # <-- your registry (e.g. ghcr.io). KEEP THE IMAGE PRIVATE:
+                                         #     it contains the fleet age key and the enrollment cert
+  IMAGE: bootc/fedora44-edge-base                 # <-- your repo path
+  CANARY_FLEET: fleets/definitions/monitoring-stack.yaml
+
+jobs:
+  build:
+    # Self-hosted runner with podman, skopeo, jq, yq and arm64 emulation (qemu binfmt).
+    # GitHub-hosted alternative: runs-on: ubuntu-24.04 (see README, "Running on GitHub").
+    runs-on: [self-hosted, bootc-builder]
+    outputs:
+      ref: ${{ steps.push.outputs.ref }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read release version
+        id: meta
+        run: echo "tag=$(tr -d '[:space:]' < bootc/RELEASE)" >> "$GITHUB_OUTPUT"
+
+      - name: Build amd64 (VARIANT defaults to vm)
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_KEY }}
+        run: |
+          podman build --secret id=sops-age-key,env=SOPS_AGE_KEY --pull=always --platform linux/amd64 \
+            -f bootc/Containerfile -t localhost/base-bootc:amd64 bootc/
+
+      - name: Build arm64 (VARIANT defaults to raspi4)
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_KEY }}
+        run: |
+          podman build --secret id=sops-age-key,env=SOPS_AGE_KEY --pull=always --platform linux/arm64 \
+            -f bootc/Containerfile -t localhost/base-bootc:arm64 bootc/
+            
+      - name: Registry login
+        run: |
+          echo "${{ secrets.REGISTRY_PASSWORD }}" | \
+            podman login "$REGISTRY" -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+
+      # The release currently in the canary fleet is the previous build. Rechunking
+      # reuses its layer layout so unchanged packages keep identical layers.
+      - name: Resolve previous release
+        id: prev
+        run: |
+          PREV=$(yq 'select(.kind == "Fleet") | .spec.template.spec.os.image' "$CANARY_FLEET")
+          echo "Previous release: $PREV"
+          for arch in amd64 arm64; do
+            digest=$(skopeo inspect --raw "docker://$PREV" 2>/dev/null | jq -r --arg a "$arch" \
+              '.manifests[]? | select(.platform.architecture == $a) | .digest' || true)
+            if [ -n "$digest" ]; then
+              echo "$arch=docker://${PREV%:*}@$digest" >> "$GITHUB_OUTPUT"
+            else
+              echo "No $arch image found for $PREV; rechunking without a previous layout"
+            fi
+          done
+
+      - name: Rechunk amd64
+        run: |
+          rm -rf rechunk && mkdir rechunk
+          bootc/rechunk.sh --platform linux/amd64 --version "${{ steps.meta.outputs.tag }}" \
+            ${{ steps.prev.outputs.amd64 && format('--previous {0}', steps.prev.outputs.amd64) || '' }} \
+            localhost/base-bootc:amd64 rechunk/amd64
+
+      - name: Rechunk arm64
+        run: |
+          bootc/rechunk.sh --platform linux/arm64 --version "${{ steps.meta.outputs.tag }}" \
+            ${{ steps.prev.outputs.arm64 && format('--previous {0}', steps.prev.outputs.arm64) || '' }} \
+            localhost/base-bootc:arm64 rechunk/arm64
+
+      # skopeo copies the rechunked layers byte-for-byte. Pushing through podman's
+      # container storage would recompress them and change their digests.
+      - name: Push multi-arch manifest
+        id: push
+        run: |
+          REF="$REGISTRY/$IMAGE:${{ steps.meta.outputs.tag }}"
+          for arch in amd64 arm64; do
+            skopeo copy --preserve-digests "oci:rechunk/$arch:latest" "docker://$REF-$arch"
+          done
+          podman manifest rm "$REF" 2>/dev/null || true
+          podman manifest create "$REF"
+          podman manifest add "$REF" "docker://$REF-amd64"
+          podman manifest add "$REF" "docker://$REF-arm64"
+          podman manifest push --all=false "$REF" "docker://$REF"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Clean up
+        if: always()
+        run: |
+          rm -rf rechunk
+          podman manifest rm "$REGISTRY/$IMAGE:${{ steps.meta.outputs.tag }}" 2>/dev/null || true
+
+  update-canary:
+    needs: build
+    # Test releases stop after the push.
+    if: ${{ !contains(needs.build.outputs.tag, '-test') }}
+    runs-on: [self-hosted, bootc-builder]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Must be a PAT / app token with push rights, NOT the built-in GITHUB_TOKEN:
+          # pushes made with GITHUB_TOKEN don't trigger disk-image-release.
+          token: ${{ secrets.FLEET_BOT_TOKEN }}
+
+      - name: Bump canary fleet
+        env:
+          NEW_REF: ${{ needs.build.outputs.ref }}
+        run: |
+          yq -i '(select(.kind == "Fleet") | .spec.template.spec.os.image) = strenv(NEW_REF)' \
+            "$CANARY_FLEET"
+
+      - name: Commit
+        run: |
+          git config user.name  "fleet-bot"
+          git config user.email "fleet-bot@example.com"
+          git diff --quiet && { echo "No change"; exit 0; }
+          git commit -am "canary: roll base image to ${{ needs.build.outputs.ref }}"
+          git push

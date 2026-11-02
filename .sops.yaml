@@ -1,0 +1,38 @@
+# SOPS configuration.
+#
+# Every secret is encrypted to the fleet age key. Its PRIVATE key is baked into
+# the base image (as a build secret), so devices can decrypt their own secrets.
+# Add your personal key, and ideally an offline break-glass key, so you can edit
+# and recover secrets without the fleet key.
+#
+# Generate a key:  age-keygen -o ~/.config/sops/age/keys.txt
+# and paste its public key ("age1...") below.
+# After changing any key here, run `sops updatekeys <file>` on every encrypted file.
+#
+# Partial encryption: in YAML/JSON/env/ini files only keys matching
+# encrypted_regex are encrypted; everything else stays plaintext.
+# mac_only_encrypted means plaintext values can be edited by hand without
+# breaking decryption. Encrypted values must still be edited with `sops edit`,
+# and an encrypted key must not be renamed or moved.
+# Binary files (*.sops.bin) are always fully encrypted.
+# NAME YOUR SECRETS SO THEY MATCH THE REGEX, or they are committed in plaintext.
+keys:
+  - &fleet age1replacewithyourfleetagepublickeyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  # - &you   age1...
+  # - &breakglass age1...
+
+creation_rules:
+  - path_regex: etc/sops/[A-Za-z0-9_-]+/[^/]+\.sops\.[^/]+$
+    mac_only_encrypted: true
+    encrypted_regex: '(?i)^(.*(secret|password|token|accesskey|private).*|.*_KEY)$'
+    key_groups:
+      - age:
+          - *fleet
+          # - *you
+  - path_regex: bootc/[^/]+\.sops\.[^/]+$
+    mac_only_encrypted: true
+    encrypted_regex: '(?i)^(content|.*(secret|password|token).*)$'
+    key_groups:
+      - age:
+          - *fleet
+          # - *you

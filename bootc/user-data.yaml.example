@@ -1,0 +1,30 @@
+# EXAMPLE ONLY. The build reads bootc/user-data.sops.yaml, which you create
+# from this file. write_files[0].content is decrypted at build time into
+# /etc/flightctl/config.yaml (the RHEM / Flight Control agent config), so
+# every device built from the image enrolls itself on first boot.
+#
+# 1. Generate an agent config with an embedded enrollment certificate:
+#      flightctl login https://rhem.example.com:3443 --web
+#      flightctl certificate request --signer enrollment --expiration 365d --output embedded > agent-config.yaml
+# 2. cp bootc/user-data.yaml.example bootc/user-data.sops.yaml
+# 3. Paste the contents of agent-config.yaml under "content: |" below
+#    (indented). It must start with "enrollment-service:".
+# 4. sops --encrypt --in-place bootc/user-data.sops.yaml
+#
+# The file is also valid cloud-init user-data, so the same content can be
+# handed to a VM with cloud-init if you prefer that over baking it in.
+# cloud-config
+write_files:
+  - path: /etc/flightctl/config.yaml
+    owner: root:root
+    permissions: "0600"
+    content: |
+      # (shape only - replace everything below with your generated agent-config.yaml)
+      enrollment-service:
+        authentication:
+          client-certificate-data: <base64 client certificate>
+          client-key-data: <base64 client key>
+        service:
+          certificate-authority-data: <base64 CA certificate>
+          server: https://agent-api.rhem.example.com:7443
+        enrollment-ui-endpoint: https://rhem.example.com:443

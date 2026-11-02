@@ -1,0 +1,47 @@
+# yamllint configuration for this repo.
+# Anything left at the default level ("error") blocks a commit; rules set to
+# "warning" are reported but don't block. Tighten over time as the repo gets cleaner.
+extends: default
+
+ignore: |
+  images/
+
+rules:
+  # Kubernetes/Flightctl manifests rarely start with '---'
+  document-start: disable
+
+  # Gitea workflows use the key `on:`, which YAML 1.1 treats as a boolean
+  truthy:
+    check-keys: false
+    level: warning
+
+  line-length:
+    max: 160
+    level: warning
+
+  indentation:
+    spaces: consistent
+    indent-sequences: consistent
+    level: warning
+
+  comments:
+    min-spaces-from-content: 1
+    level: warning
+  comments-indentation:
+    level: warning
+  trailing-spaces:
+    level: warning
+  empty-lines:
+    level: warning
+  new-line-at-end-of-file:
+    level: warning
+  brackets:
+    level: warning
+  braces:
+    level: warning
+  colons:
+    level: warning
+  commas:
+    level: warning
+  hyphens:
+    level: warning

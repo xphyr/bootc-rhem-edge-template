@@ -1,0 +1,8 @@
+apiVersion: flightctl.io/v1beta1
+kind: ResourceSync
+metadata:
+  name: fleet-sync
+spec:
+  repository: bootc-edge-fleet
+  path: /fleets/definitions
+  targetRevision: main

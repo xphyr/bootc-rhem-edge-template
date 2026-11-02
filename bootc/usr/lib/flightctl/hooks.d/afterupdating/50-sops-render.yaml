@@ -1,0 +1,12 @@
+# Re-render SOPS secrets for any app whose encrypted files under /etc/sops/
+# changed. sops-render trial-decrypts every changed app first; a non-zero exit
+# makes the RHEM agent cancel and roll back the update, leaving running apps
+# on their current secrets.
+#
+# Compare the schema with /usr/lib/flightctl/hooks.d/afterupdating/00-default.yaml
+# shipped by your agent version.
+- if:
+    - path: /etc/sops/
+      op: [created, updated, removed]
+  run: /usr/libexec/sops-render/sops-render sync
+  timeout: 120s

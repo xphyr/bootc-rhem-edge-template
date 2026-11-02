@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# .githooks/pre-commit
+# 1. Refuses to commit any *.sops.* file that is not sops-encrypted.
+# 2. Lints every tracked YAML file in the repo, using the STAGED version of each file,
+#    so what gets checked is exactly what will be committed.
+#      Errors (bad syntax, duplicate keys, ...) block the commit.
+#      Style issues are reported as warnings and do not block.
+# Enable with: git config core.hooksPath .githooks
+# Bypass in an emergency with: git commit --no-verify
+set -euo pipefail
+
+# --- 1. Unencrypted secrets ---------------------------------------------------
+# sops writes a MAC into every file it encrypts: "sops_mac=ENC[" in env files,
+# "mac: ENC[" in YAML, "\"mac\": \"ENC[" in JSON and binary files.
+unencrypted=()
+while IFS= read -r -d '' f; do
+  if ! git show ":$f" | grep -Eq '(^sops_mac=ENC\[|^[[:space:]]*mac: ENC\[|"mac": *"ENC\[)'; then
+    unencrypted+=("$f")
+  fi
+done < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.sops.*' ':!.sops.yaml')
+if ((${#unencrypted[@]})); then
+  echo "pre-commit: these files are named *.sops.* but are NOT encrypted:" >&2
+  printf '  %s\n' "${unencrypted[@]}" >&2
+  echo "pre-commit: encrypt them with: sops --encrypt --in-place <file>" >&2
+  exit 1
+fi
+
+# --- 2. YAML lint -------------------------------------------------------------
+
+if ! command -v yamllint >/dev/null 2>&1; then
+  echo "pre-commit: yamllint is not installed (sudo dnf install yamllint)." >&2
+  echo "pre-commit: install it, or bypass once with: git commit --no-verify" >&2
+  exit 1
+fi
+
+repo=$(git rev-parse --show-toplevel)
+config="$repo/.yamllint"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# Export the staged copy of every tracked *.yaml / *.yml file into a scratch directory.
+git ls-files -z -- '*.yaml' '*.yml' \
+  | git checkout-index -z --stdin --prefix="$tmp/"
+
+cd "$tmp"
+if [ -z "$(ls -A)" ]; then
+  exit 0
+fi
+
+args=()
+[ -f "$config" ] && args=(-c "$config")
+
+if ! yamllint "${args[@]}" .; then
+  echo >&2
+  echo "pre-commit: YAML errors found (see above). Commit aborted." >&2
+  echo "pre-commit: fix them and 'git add' again, or bypass with: git commit --no-verify" >&2
+  exit 1
+fi

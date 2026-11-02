@@ -1,0 +1,29 @@
+# Prometheus for the monitoring fleet.
+# Every device also pushes its host metrics here with Alloy remote write
+# (see bootc/etc/alloy/conf.d/00-base.alloy), which needs
+# --web.enable-remote-write-receiver (set in the monitoring-stack fleet).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+        # - alertmanager:9093
+
+rule_files:
+# - "first_rules.yml"
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Traefik exposes Prometheus metrics on its "traefik" entrypoint (:8080).
+  - job_name: traefik
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - proxy1.example.com:8080
+          - proxy2.example.com:8080

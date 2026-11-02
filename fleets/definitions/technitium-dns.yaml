@@ -1,0 +1,124 @@
+apiVersion: flightctl.io/v1beta1
+kind: Fleet
+metadata:
+  name: technitium-dns
+spec:
+  selector:
+    matchLabels:
+      fleet: technitium-dns
+  # Rollout Policy: Enforces a 1-by-1 serial update
+  rolloutPolicy:
+    deviceSelection:
+      strategy: BatchSequence
+      sequence:
+        - limit: 1
+    successThreshold: 100%
+    defaultUpdateTimeout: 30m
+    disruptionBudget:
+      maxUnavailable: 1
+  template:
+    spec:
+      os:
+        image: registry.example.com/bootc/fedora44-edge-base:2026.11.2
+      config:
+        - name: timezone-config
+          inline:
+            - path: /etc/tmpfiles.d/timezone-link.conf
+              content: |
+                L+ /etc/localtime - - - - /usr/share/zoneinfo/America/New_York
+        - name: technitium-config
+          gitRef:
+            repository: bootc-edge-fleet
+            targetRevision: main
+            path: /fleets/technitium-dns/cfg
+        - name: hostname-config
+          inline:
+            - path: /etc/hostname
+              content: "{{ .metadata.labels.alias }}"
+              mode: 0644
+      applications:
+        - name: technitium-app
+          appType: quadlet
+          envVars:
+            DNS_SERVER_DOMAIN: "{{ .metadata.labels.domainname }}"
+            # DNS_SERVER_ADMIN_PASSWORD: "<your password here>"
+            DNS_SERVER_ENABLE_BLOCKING: "true"
+            DNS_SERVER_BLOCK_LIST_URLS: "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling/hosts"
+          inline:
+            - path: technitium.container
+              content: |-
+                [Unit]
+                Description=Technitium Recursive DNS Server
+                Documentation=https://technitium.com/dns/
+
+                [Container]
+                Image=docker.io/technitium/dns-server:latest
+                Label="io.containers.autoupdate=registry"
+                Network=host
+
+                Volume=/usr/share/zoneinfo/America/New_York:/etc/localtime:ro
+                Volume=/etc/technitium:/etc/dns:Z
+                Volume=/var/lib/lego/technitium:/etc/dns/ssl:Z
+
+                # This is enabled by default
+                NoNewPrivileges=true
+                DropCapability=All
+                AddCapability=NET_BIND_SERVICE
+
+                # Add in health checks to ensure service is running
+                # Will use dig to check that the local server is responding
+                HealthCmd=dig @localhost || exit 1
+                HealthInterval=30s
+                HealthTimeout=10s
+                HealthRetries=3
+                HealthStartPeriod=90s
+                # Ensures systemd waits for health check
+                Notify=healthy
+
+                [Service]
+                Restart=on-failure
+                RestartSec=20
+                TimeoutStartSec=900
+                TimeoutStopSec=180
+
+                [Install]
+                WantedBy=default.target
+              contentEncoding: plain
+            - path: lego.container
+              content: |-
+                [Unit]
+                Description=Lego DNS Renewal Container
+                Requires=sops-render@lego.service
+                After=network.target sops-render@lego.service
+
+                [Container]
+                Image=docker.io/goacme/lego:latest
+                Volume=/var/lib/lego:/var/lib/lego:Z
+
+                # Inject the cloudflare token secret as an environment variable
+                EnvironmentFile=/run/sops-secrets/lego/lego.env
+
+                # Command to run daily renewal
+                Exec=run --email="admin@example.com" --dns="cloudflare" --dns.resolvers 1.1.1.1 --dns.resolvers 8.8.8.8 --domains="{{ .metadata.labels.alias }}" --accept-tos --path /var/lib/lego --deploy-hook="openssl pkcs12 -export -out /var/lib/lego/technitium/hostcertificate.pfx -inkey /var/lib/lego/certificates/{{ .metadata.labels.alias }}.key -in /var/lib/lego/certificates/{{ .metadata.labels.alias }}.crt -passout pass:"
+
+                [Service]
+                Type=oneshot
+            - path: lego.timer
+              content: |-
+                [Unit]
+                Description=Run Lego Renewal Once A Day
+
+                [Timer]
+                OnCalendar=daily
+                Persistent=true
+
+                [Install]
+                WantedBy=timers.target
+      resources:
+        - monitorType: CPU
+          alertRules:
+            - severity: Warning
+              duration: 10m
+              percentage: 50
+              description: 'CPU load is above 50% for more than 10 minutes.'
+          samplingInterval: 30s

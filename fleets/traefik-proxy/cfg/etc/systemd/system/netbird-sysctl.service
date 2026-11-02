@@ -1,0 +1,19 @@
+[Unit]
+Description=Configure Host Sysctl for NetBird Container
+DefaultDependencies=no
+After=systemd-sysctl.service
+Before=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/sysctl -w \
+  net.ipv4.conf.all.src_valid_mark=1 \
+  net.ipv4.conf.all.rp_filter=2 \
+  net.ipv4.conf.default.rp_filter=2 \
+  net.ipv4.ip_forward=1 \
+  net.ipv6.conf.all.disable_ipv6=0 \
+  net.ipv6.conf.all.forwarding=1
+
+[Install]
+WantedBy=multi-user.target

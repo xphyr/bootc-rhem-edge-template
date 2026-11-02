@@ -1,0 +1,42 @@
+http:
+  routers:
+    registry-http:
+      rule: "Host(`registry.example.com`)"
+      entryPoints:
+        - "web"
+      middlewares:
+        - "secure-redirect"
+      service: "noop" # A dummy service is required, but it will never be reached due to the redirect
+
+    # 2. Catch HTTPS traffic on port 443 and forward to your backend app
+    registry-https:
+      rule: "Host(`registry.example.com`)"
+      entryPoints:
+        - "websecure"
+      service: "registry-service"
+      tls:
+        certResolver: "letsencrypt"
+
+  middlewares:
+    # Define the redirect middleware rule
+    secure-redirect:
+      redirectScheme:
+        scheme: "https"
+        permanent: true
+
+  services:
+    registry-service:
+      loadBalancer:
+        serversTransport: skipVerifyTransport
+        servers:
+          - url: https://zot1.example.com:5000
+
+    # Dummy service required by the HTTP router syntax validation
+    noop:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1"
+
+  serversTransports:
+    skipVerifyTransport:
+      insecureSkipVerify: true

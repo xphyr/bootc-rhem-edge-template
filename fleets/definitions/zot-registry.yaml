@@ -1,0 +1,111 @@
+apiVersion: flightctl.io/v1beta1
+kind: Fleet
+metadata:
+  name: zot-registry
+spec:
+  selector:
+    matchLabels:
+      fleet: zot-registry
+  # Rollout Policy: Enforces a 1-by-1 serial update
+  rolloutPolicy:
+    deviceSelection:
+      strategy: BatchSequence
+      sequence:
+        - limit: 1
+    successThreshold: 100%
+    defaultUpdateTimeout: 30m
+    disruptionBudget:
+      maxUnavailable: 1
+  template:
+    spec:
+      os:
+        image: registry.example.com/bootc/fedora44-edge-base:2026.11.2
+      config:
+        - name: timezone-config
+          inline:
+            - path: /etc/tmpfiles.d/timezone-link.conf
+              content: |
+                L+ /etc/localtime - - - - /usr/share/zoneinfo/America/New_York
+        - name: zot-config
+          gitRef:
+            repository: bootc-edge-fleet
+            targetRevision: main
+            path: /fleets/zot-registry/cfg
+        - name: hostname-config
+          inline:
+            - path: /etc/hostname
+              content: "{{ .metadata.labels.alias }}"
+              mode: 0644
+      applications:
+        # Inline Quadlet definition for pod to run all zot components
+        - name: zot-app
+          appType: quadlet
+          inline:
+            - path: zot-redis.container
+              content: |
+                [Unit]
+                Description=Redis metadata/dedupe cache for zot
+
+                [Container]
+                ContainerName=zot-redis
+                Image=docker.io/library/redis:7.4
+                Pod=zot.pod
+                Exec=redis-server /usr/local/etc/redis/redis.conf
+
+                # Local directory mounts
+                Volume=/var/lib/redis/data:/data:Z
+                Volume=/etc/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro,Z
+
+                # Mark the unit started only once Redis answers, so zot waits for it
+                HealthCmd=redis-cli ping
+                HealthInterval=10s
+                HealthRetries=5
+                HealthStartPeriod=10s
+                Notify=healthy
+
+                [Service]
+                Restart=always
+                TimeoutStartSec=120
+            # An image backed volume quadlet
+            - path: zot.container
+              content: |
+                [Unit]
+                Description=Zot OCI registry
+                Requires=zot-redis.service sops-render@zot-registry.service
+                After=zot-redis.service sops-render@zot-registry.service
+
+
+                [Container]
+                ContainerName=zot
+                # Pin a specific release; check https://github.com/project-zot/zot/releases
+                Image=ghcr.io/project-zot/zot-linux-amd64:v2.1.20
+                Pod=zot.pod
+
+                # Local directory mounts
+                # /etc/zot holds config.json, htpasswd, tls.crt/tls.key, sync-credentials.json
+                Volume=/etc/zot:/etc/zot:ro,Z
+                # Local rootDirectory (metadata only; image blobs live in RustFS)
+                Volume=/var/lib/zot:/var/lib/zot:Z
+                Volume=/run/sops-secrets/zot-registry/config.json:/etc/zot/config.json:ro,Z
+                Volume=/run/sops-secrets/zot-registry/htpasswd.bin:/etc/zot/htpasswd.bin:ro,Z
+
+                # Trust your internal CA for RustFS and Docker Hub TLS (uncomment if RustFS uses an internal CA).
+                # This replaces the image's CA bundle, so the host bundle must include public CAs too (it does on RHEL/Fedora).
+                #Volume=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem:/etc/ssl/certs/ca-certificates.crt:ro
+
+                [Service]
+                Restart=always
+                # Startup storage walk can be slow on a large bucket
+                TimeoutStartSec=900
+            - path: zot.pod
+              content: |
+                [Unit]
+                Description=Zot registry pod (zot + redis)
+
+                [Pod]
+                PodName=zot
+                # Only the registry port is published. Redis stays on the pod's localhost.
+                PublishPort=5000:5000
+
+                [Install]
+                WantedBy=multi-user.target default.target

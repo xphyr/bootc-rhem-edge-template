@@ -1,0 +1,24 @@
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataImportCron
+metadata:
+  name: fedora44-bootc-image-cron
+  namespace: os-images
+  labels:
+    instancetype.kubevirt.io/default-preference: fedora
+spec:
+  garbageCollect: Outdated
+  managedDataSource: fedora44-bootc
+  importsToKeep: 2
+  schedule: 07 * * * *
+  retentionPolicy: None
+  template:
+    metadata: {}
+    spec:
+      source:
+        registry:
+          pullMethod: node
+          url: 'docker://registry.example.com/bootc/fedora44-edge-base-disk:latest'
+      storage:
+        resources:
+          requests:
+            storage: 32Gi

@@ -1,0 +1,131 @@
+apiVersion: flightctl.io/v1beta1
+kind: Fleet
+metadata:
+  name: monitoring-stack
+spec:
+  selector:
+    matchLabels:
+      fleet: monitoring-stack
+  rolloutPolicy:
+    successThreshold: 100% # Requires each machine to pass health checks perfectly
+    deviceSelection:
+      strategy: 'BatchSequence'
+      sequence:
+        - limit: 1 # Step 1: Update exactly 1 machine first
+        - limit: 100% # Step 2: Update the remaining machine after Step 1 succeeds
+  template:
+    spec:
+      os:
+        image: registry.example.com/bootc/fedora44-edge-base:2026.11.2
+      config:
+        - name: timezone-config
+          inline:
+            - path: /etc/tmpfiles.d/timezone-link.conf
+              content: |
+                L+ /etc/localtime - - - - /usr/share/zoneinfo/America/New_York
+        - name: grafana-config
+          gitRef:
+            repository: bootc-edge-fleet
+            targetRevision: main
+            path: /fleets/monitoring/cfg
+        - name: hostname-config
+          inline:
+            - path: /etc/hostname
+              content: "{{ .metadata.labels.alias }}"
+              mode: 0644
+      applications:
+        - name: grafana-app
+          appType: quadlet
+          inline:
+            - path: .container
+              content: |-
+                [Unit]
+                Description=Grafana data visualizer
+                Documentation=https://grafana.com/
+                Requires=sops-render@grafana.service
+                After=sops-render@grafana.service
+
+                [Container]
+                ContainerName=grafana
+                Image=docker.io/grafana/grafana
+                #PublishPort=3000:3000
+                Network=host
+
+                EnvironmentFile=/run/sops-secrets/grafana/grafana.env
+
+                Volume=/usr/share/zoneinfo/America/New_York:/etc/localtime:ro
+                Volume=/etc/grafana:/etc/grafana:Z
+                Volume=/var/lib/grafana:/var/lib/grafana:Z,U
+
+                # This is enabled by default
+                NoNewPrivileges=true
+                DropCapability=All
+
+                # Add in health checks to ensure service is running
+                # Will use dig to check that the local server is responding
+                #HealthCmd=dig @127.0.0.1 || exit 1
+                #HealthInterval=30s
+                #HealthTimeout=10s
+                #HealthRetries=3
+                #HealthStartPeriod=90s
+                ## Ensures systemd waits for health check
+                #Notify=healthy
+
+                [Service]
+                Restart=always
+
+                [Install]
+                WantedBy=default.target
+              contentEncoding: plain
+        - name: prometheus-app
+          appType: quadlet
+          inline:
+            - path: .container
+              content: |-
+                [Unit]
+                Description=Prometheus time series database
+                Documentation=https://prometheus.io/
+
+                [Container]
+                ContainerName=prometheus
+                Image=quay.io/prometheus/prometheus
+                #PublishPort=9090:9090
+                Network=host
+
+                Exec=--config.file=/etc/prometheus/prometheus.yml \
+                     --config.auto-reload \
+                     --config.auto-reload-interval=15s \
+                     --web.enable-remote-write-receiver
+
+                Volume=/usr/share/zoneinfo/America/New_York:/etc/localtime:ro
+                Volume=/etc/prometheus:/etc/prometheus:Z
+                Volume=/var/lib/prometheus:/prometheus:Z,U
+
+                # This is enabled by default
+                NoNewPrivileges=true
+                DropCapability=All
+
+                # Add in health checks to ensure service is running
+                # Will use dig to check that the local server is responding
+                #HealthCmd=dig @127.0.0.1 || exit 1
+                #HealthInterval=30s
+                #HealthTimeout=10s
+                #HealthRetries=3
+                #HealthStartPeriod=90s
+                ## Ensures systemd waits for health check
+                #Notify=healthy
+
+                [Service]
+                Restart=always
+
+                [Install]
+                WantedBy=default.target
+              contentEncoding: plain
+      resources:
+        - monitorType: CPU
+          alertRules:
+            - severity: Warning
+              duration: 10m
+              percentage: 50
+              description: 'CPU load is above 50% for more than 10 minutes.'
+          samplingInterval: 30s

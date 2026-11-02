@@ -1,0 +1,43 @@
+# .github/workflows/promote-base-image.yaml
+#
+# Runs on GitHub Actions and Gitea Actions (Gitea also reads .github/workflows).
+# Jobs need a self-hosted runner with the labels shown in runs-on; see
+# "Running on GitHub" in the README for GitHub-hosted runners.
+#
+# Run manually once the canary fleet looks healthy.
+# Copies the canary fleet's image reference to every Fleet under fleets/definitions/.
+
+name: promote-base-image
+
+on:
+  workflow_dispatch:
+
+env:
+  CANARY_FLEET: fleets/definitions/monitoring-stack.yaml
+
+jobs:
+  promote:
+    runs-on: [self-hosted, bootc-builder]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.FLEET_BOT_TOKEN }}
+
+      - name: Copy canary image to all fleets
+        run: |
+          NEW_REF=$(yq 'select(.kind == "Fleet") | .spec.template.spec.os.image' "$CANARY_FLEET")
+          [ -n "$NEW_REF" ] || { echo "Could not read canary image"; exit 1; }
+          export NEW_REF
+          echo "Promoting $NEW_REF"
+          for f in fleets/definitions/*.yaml; do
+            yq -i '(select(.kind == "Fleet") | .spec.template.spec.os.image) = strenv(NEW_REF)' "$f"
+          done
+          echo "NEW_REF=$NEW_REF" >> "$GITHUB_ENV"
+
+      - name: Commit
+        run: |
+          git config user.name  "fleet-bot"
+          git config user.email "fleet-bot@example.com"
+          git diff --quiet && { echo "Nothing to promote"; exit 0; }
+          git commit -am "fleets: promote base image $NEW_REF"
+          git push

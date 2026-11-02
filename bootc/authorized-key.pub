@@ -1,0 +1,3 @@
+# Replace this file with the SSH public key(s) for the admin user created in
+# the Containerfile (ADMIN_USER, default "admin"), one key per line, e.g.:
+# ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... you@example.com

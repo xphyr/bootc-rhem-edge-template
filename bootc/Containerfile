@@ -1,0 +1,180 @@
+FROM quay.io/fedora/fedora-bootc:44
+
+# One Containerfile for every base image.
+#
+#   TARGETARCH  Set automatically by podman from --platform (amd64, arm64).
+#               Used only where a download is architecture-specific.
+#   VARIANT     Hardware the image is for. Defaults from TARGETARCH:
+#                 amd64 -> vm      (cloud-init, open-vm-tools, qemu-guest-agent)
+#                 arm64 -> raspi4  (no VM tooling)
+#               Override with --build-arg VARIANT=<name>.
+#
+#   podman build --platform linux/amd64 -f bootc/Containerfile ...
+#   podman build --platform linux/arm64 -f bootc/Containerfile ...
+ARG TARGETARCH
+ARG VARIANT
+
+# Fix for "no default root filesystem type specified in container"
+RUN mkdir -p /usr/lib/bootc/install && cat <<-'EOF' > /usr/lib/bootc/install/00-fedora.toml
+[install]
+root-fs-type = "xfs"
+EOF
+
+# Resolve and record the variant so later steps (and anyone inspecting a
+# running system) can read it from /usr/lib/edge-base/variant.
+RUN variant=${VARIANT:-$(case "$TARGETARCH" in amd64) echo vm ;; arm64) echo raspi4 ;; esac)} && \
+    case "$variant" in \
+      vm|raspi4) ;; \
+      *) echo "unknown VARIANT '$variant' (TARGETARCH=$TARGETARCH); expected vm or raspi4" >&2; exit 1 ;; \
+    esac && \
+    install -D -m 0644 /dev/null /usr/lib/edge-base/variant && \
+    echo "$variant" > /usr/lib/edge-base/variant
+
+# Fixed UIDs/GIDs for the system accounts our added packages create.
+# Package scriptlets allocate IDs dynamically (counting down from 999), so any
+# change to the package set shifts them. On bootc, files in /etc and /var keep
+# their numeric owners across updates while /etc/passwd and /etc/group come
+# from the new image, so a shifted ID locks a service out of its own files.
+# Creating the accounts first makes the packages reuse them.
+# This only helps devices whose /etc/passwd and /etc/group still match the
+# image. cloud-init-provisioned devices have their own copies (bootc keeps
+# locally modified files), so anything owned by these accounts must also be
+# fixed up by name at boot, e.g. with a tmpfiles.d z/Z rule (see alloy below).
+# The values below are examples. On a new deployment, pick any unused system
+# IDs (below 1000) once, and then NEVER change them: devices already in the
+# field keep files owned by these numbers. Add new accounts here with an
+# unused ID.
+RUN case "$TARGETARCH" in \
+      amd64) alloy=974 console=973 dhcpcd=975 ;; \
+      arm64) alloy=975 console=974 dhcpcd= ;; \
+      *) echo "no fixed account IDs for TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    groupadd -r -g "$alloy" alloy && \
+    useradd -r -u "$alloy" -g alloy -d /var/lib/alloy -s /sbin/nologin -c "alloy user" alloy && \
+    groupadd -r -g "$console" flightctl-console && \
+    useradd -r -u "$console" -g flightctl-console -d /var/lib/flightctl -s /bin/bash \
+      -c "Flightctl Agent Console User" flightctl-console && \
+    usermod -a -G flightctl-console flightctl-console && \
+    if [ -n "$dhcpcd" ]; then \
+      groupadd -r -g "$dhcpcd" dhcpcd && \
+      useradd -r -u "$dhcpcd" -g dhcpcd -d /var/lib/dhcpcd -s /usr/sbin/nologin \
+        -c "Minimalistic DHCP client" dhcpcd; \
+    fi
+
+# Steps are ordered so package installs (slow, rarely change) come first and
+# local config (changes often) comes last, so config edits rebuild quickly.
+
+# Update the base container
+RUN dnf upgrade -y && \
+    dnf clean all && \
+    rm -rf /var/{cache,log} /run/dnf /tmp/*
+
+# Add greenboot age chrony audit
+RUN dnf -y install greenboot greenboot-default-health-checks age chrony dnf5-plugins audit \
+    --nodocs --setopt=install_weak_deps=False && \
+    dnf clean all && \
+    rm -rf /var/{cache,log} /run/dnf /tmp/* && \
+    systemctl enable greenboot-healthcheck.service && \
+    systemctl enable chronyd.service && \
+    systemctl enable auditd.service
+
+# Install sops from github repository. The RPM architecture (x86_64, aarch64)
+# comes from rpm itself, so no per-arch mapping is needed.
+ARG SOPS_VERSION=3.13.3
+RUN dnf install -y https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops-${SOPS_VERSION}-1.$(rpm --eval '%{_arch}').rpm && \
+    dnf clean all && \
+    rm -rf /var/{cache,log} /run/dnf /tmp/*
+
+# VM variant only: cloud-init, open-vm-tools and qemu-guest-agent.
+# On other variants this step does nothing.
+RUN [ "$(cat /usr/lib/edge-base/variant)" = vm ] || exit 0; \
+    dnf -y install cloud-init open-vm-tools qemu-guest-agent \
+      --nodocs --setopt=install_weak_deps=False && \
+    dnf clean all && \
+    rm -rf /var/{cache,log} /run/cloud-init /run/dnf /tmp/* && \
+    ln -s ../cloud-init.target /usr/lib/systemd/system/default.target.wants && \
+    systemctl enable vmtoolsd.service && \
+    systemctl enable cloud-init-local.service && \
+    systemctl enable cloud-config.service && \
+    systemctl enable cloud-final.service
+
+# Add alloy log agent to the image (its config is copied in further down).
+# dnf imports the repo signing key from gpgkey= in grafana.repo.
+# Pinned because the binary is ~570 MB (~160 MB compressed): every version
+# change is a large download for every device, so update deliberately.
+# renovate: datasource=rpm depName=alloy registryUrl=https://rpm.grafana.com/
+ARG ALLOY_VERSION=1.20.1
+COPY etc/yum.repos.d/grafana.repo /etc/yum.repos.d/grafana.repo
+RUN dnf install -y alloy${ALLOY_VERSION:+-${ALLOY_VERSION}} && \
+    dnf clean all && \
+    rm -rf /var/{cache,log} /run/dnf /tmp/* && \
+    rm -f /etc/alloy/config.* && \
+    systemctl enable alloy.service
+RUN printf '%s\n' \
+      "u alloy $(id -u alloy):alloy \"Grafana Alloy\" /var/lib/alloy /sbin/nologin" \
+      'm alloy adm' \
+      'm alloy systemd-journal' > /usr/lib/sysusers.d/alloy.conf && \
+    printf '%s\n' \
+      '# Ownership is set by name at every boot, from the device'"'"'s own /etc/group.' \
+      '# Devices provisioned with cloud-init have a locally modified /etc/passwd and' \
+      '# /etc/group that bootc never replaces, so their alloy ID can differ from the' \
+      '# image'"'"'s; numeric ownership shipped in the image would lock alloy out.' \
+      'd /var/lib/alloy 0770 alloy alloy -' \
+      'Z /var/lib/alloy - alloy alloy -' \
+      'z /etc/alloy 0770 root alloy -' > /usr/lib/tmpfiles.d/alloy.conf
+
+# Add Flight Control agent
+# renovate: datasource=rpm depName=flightctl-agent registryUrl=https://rpm.flightctl.io/epel/9/x86_64/
+ARG FLIGHTCTL_VERSION=1.3.0
+RUN dnf -y config-manager addrepo --from-repofile=https://rpm.flightctl.io/flightctl-fedora.repo && \
+    dnf -y install flightctl-agent${FLIGHTCTL_VERSION:+-${FLIGHTCTL_VERSION}} \
+      --nodocs --setopt=install_weak_deps=False && \
+    dnf clean all && \
+    rm -rf /var/{cache,log} /run/dnf /tmp/* && \
+    systemctl enable flightctl-agent.service
+
+# Add local admin user, with the SSH public key(s) from authorized-key.pub.
+# Override the name with --build-arg ADMIN_USER=<name>.
+ARG ADMIN_USER=admin
+RUN --mount=type=bind,source=authorized-key.pub,target=/tmp/authorized-key.pub,relabel=shared \
+    getent passwd "$ADMIN_USER" >/dev/null 2>&1 || useradd -m -G wheel "$ADMIN_USER" && \
+    mkdir -p "/home/$ADMIN_USER/.ssh" && \
+    install -m 0600 -o "$ADMIN_USER" -g "$ADMIN_USER" /tmp/authorized-key.pub "/home/$ADMIN_USER/.ssh/authorized_keys" && \
+    printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$ADMIN_USER" > "/etc/sudoers.d/90-$ADMIN_USER" && \
+    chmod 0440 "/etc/sudoers.d/90-$ADMIN_USER"
+
+# Renderer script, systemd unit, tmpfiles config, RHEM afterUpdating hook and
+# greenboot health checks.
+COPY usr/ /usr/
+RUN chmod 0755 /usr/libexec/sops-render/sops-render \
+      /usr/lib/greenboot/check/wanted.d/50-critical-services.sh
+
+# Alloy config. COPY resets /etc/alloy to root:root 0755; restore the
+# root:alloy 0770 the alloy package sets. On devices this is re-applied by name
+# at boot (tmpfiles z rule above), because the device's alloy ID can differ.
+COPY etc/ /etc/
+RUN chown root:alloy /etc/alloy && \
+    chmod 0770 /etc/alloy
+
+# Add label to node based on system architecture
+COPY label-architecture.yaml /etc/flightctl/conf.d/label-architecture.yaml
+
+# Flight Control agent config. Decrypted at build time from the cloud-init
+# user-data (write_files[0].content) using the lab age key build secret.
+RUN --mount=type=secret,id=sops-age-key,required=true \
+    --mount=type=bind,source=user-data.sops.yaml,target=/tmp/user-data.sops.yaml,relabel=shared \
+    SOPS_AGE_KEY_FILE=/run/secrets/sops-age-key \
+    sops --decrypt --extract '["write_files"][0]["content"]' /tmp/user-data.sops.yaml > /tmp/config.yaml && \
+    grep -q '^enrollment-service:' /tmp/config.yaml \
+      || { echo "failed to render /etc/flightctl/config.yaml from user-data.sops.yaml" >&2; exit 1; } && \
+    install -D -m 0600 -o root -g root /tmp/config.yaml /etc/flightctl/config.yaml && \
+    rm -f /tmp/config.yaml
+
+# Fleet age key: root-only, in /usr so it changes only with the image.
+# Fails the build if the secret is empty or not an age key.
+RUN --mount=type=secret,id=sops-age-key,required=true \
+    grep -q '^AGE-SECRET-KEY-1' /run/secrets/sops-age-key \
+      || { echo "sops-age-key secret is empty or not an age key" >&2; exit 1; } && \
+    install -D -m 0400 -o root -g root /run/secrets/sops-age-key /usr/lib/sops/age/keys.txt
+
+RUN bootc container lint

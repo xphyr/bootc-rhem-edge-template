@@ -1,0 +1,167 @@
+#!/usr/bin/bash
+# sops-render: decrypt SOPS-encrypted application secrets into tmpfs.
+#
+# Layout (conventions):
+#   /etc/sops/<app>/<name>.sops.<ext>   encrypted, synced by RHEM (Git config provider)
+#   /run/sops-secrets/<app>/<name>.<ext> decrypted, tmpfs
+#   /run/sops-render/<app>.sha256        hash of the encrypted files last rendered
+#
+# Modes:
+#   render <app>  Decrypt one app into a staging dir and swap it into place.
+#                 Run by sops-render@<app>.service; do not call directly.
+#   check <app>   Trial-decrypt one app into a throwaway dir. Changes nothing.
+#   sync          Called by the RHEM afterUpdating hook. Finds apps whose
+#                 encrypted files changed, trial-decrypts all of them, and only
+#                 if every trial succeeds restarts sops-render@<app> for each.
+#                 Cleans up apps whose /etc/sops/<app> directory disappeared.
+#                 Exits non-zero on any failure so the agent rolls back.
+set -euo pipefail
+shopt -s nullglob
+
+SRC_ROOT=${SOPS_RENDER_SRC:-/etc/sops}
+OUT_ROOT=${SOPS_RENDER_OUT:-/run/sops-secrets}
+STATE_ROOT=${SOPS_RENDER_STATE:-/run/sops-render}
+SOPS=${SOPS_RENDER_SOPS:-/usr/bin/sops}
+SYSTEMCTL=${SOPS_RENDER_SYSTEMCTL:-systemctl}
+# Decrypted files are readable inside containers (which may run as non-root);
+# host access is blocked by the 0700 directories above them.
+FILE_MODE=${SOPS_RENDER_FILE_MODE:-0644}
+export SOPS_AGE_KEY_FILE=${SOPS_AGE_KEY_FILE:-/usr/lib/sops/age/keys.txt}
+
+log() { echo "sops-render: $*" >&2; }
+die() { log "error: $*"; exit 1; }
+
+valid_app() { [[ $1 =~ ^[A-Za-z0-9_-]+$ ]]; }
+
+require_app() {
+    local app=$1
+    valid_app "$app" || die "invalid app name '$app' (allowed: letters, digits, - and _)"
+    [[ -d $SRC_ROOT/$app ]] || die "no encrypted secrets directory $SRC_ROOT/$app"
+}
+
+ensure_dirs() {
+    umask 077
+    mkdir -p "$OUT_ROOT" "$STATE_ROOT"
+    chmod 0700 "$OUT_ROOT" "$STATE_ROOT"
+}
+
+# Hash of the names and contents of an app's encrypted files.
+app_hash() {
+    local app=$1 f
+    (
+        cd "$SRC_ROOT/$app"
+        for f in *.sops.*; do
+            [[ -f $f ]] || continue
+            printf '%s\0' "$f"
+            sha256sum <"$f"
+        done
+    ) | sha256sum | cut -d' ' -f1
+}
+
+# Decrypt every <name>.sops.<ext> of an app into <dest>/<name>.<ext>.
+decrypt_into() {
+    local app=$1 dest=$2 f out n=0
+    for f in "$SRC_ROOT/$app"/*.sops.*; do
+        [[ -f $f ]] || continue
+        out=$(basename "$f")
+        out=${out/.sops./.}
+        if ! "$SOPS" --decrypt --output "$dest/$out" "$f"; then
+            log "failed to decrypt $f"
+            return 1
+        fi
+        chmod "$FILE_MODE" "$dest/$out"
+        n=$((n + 1))
+    done
+    log "$app: decrypted $n file(s)"
+}
+
+cmd_render() {
+    local app=$1 hash tmp old
+    require_app "$app"
+    ensure_dirs
+    # Hash first: if files change while we render, the next sync sees a mismatch.
+    hash=$(app_hash "$app")
+    tmp=$(mktemp -d "$OUT_ROOT/.staging-$app.XXXXXX")
+    trap 'rm -rf -- "$tmp"' EXIT
+    decrypt_into "$app" "$tmp" || die "$app: render failed, previous secrets left in place"
+    chmod 0700 "$tmp"
+    if [[ -e $OUT_ROOT/$app ]]; then
+        old=$(mktemp -u "$OUT_ROOT/.old-$app.XXXXXX")
+        mv -T -- "$OUT_ROOT/$app" "$old"
+        mv -T -- "$tmp" "$OUT_ROOT/$app"
+        rm -rf -- "$old"
+    else
+        mv -T -- "$tmp" "$OUT_ROOT/$app"
+    fi
+    trap - EXIT
+    printf '%s\n' "$hash" >"$STATE_ROOT/$app.sha256"
+    log "$app: secrets rendered to $OUT_ROOT/$app"
+}
+
+cmd_check() {
+    local app=$1 tmp rc=0
+    require_app "$app"
+    ensure_dirs
+    tmp=$(mktemp -d "$OUT_ROOT/.check-$app.XXXXXX")
+    decrypt_into "$app" "$tmp" >/dev/null 2>&1 || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        # Re-run with output visible so the failure reaches the journal.
+        rm -rf -- "$tmp"; tmp=$(mktemp -d "$OUT_ROOT/.check-$app.XXXXXX")
+        decrypt_into "$app" "$tmp" || true
+    fi
+    rm -rf -- "$tmp"
+    return "$rc"
+}
+
+cmd_sync() {
+    local dir app hash old
+    local -a changed=() failed=()
+    ensure_dirs
+
+    if [[ -d $SRC_ROOT ]]; then
+        for dir in "$SRC_ROOT"/*/; do
+            app=$(basename "$dir")
+            if ! valid_app "$app"; then
+                log "warning: skipping $dir (invalid app name)"
+                continue
+            fi
+            hash=$(app_hash "$app")
+            old=$(cat "$STATE_ROOT/$app.sha256" 2>/dev/null || true)
+            [[ $hash == "$old" ]] || changed+=("$app")
+        done
+    fi
+
+    # Trial-decrypt everything that changed before touching anything.
+    for app in "${changed[@]}"; do
+        cmd_check "$app" || failed+=("$app")
+    done
+    if ((${#failed[@]})); then
+        die "decryption failed for: ${failed[*]}; nothing changed, update will be rolled back"
+    fi
+
+    for app in "${changed[@]}"; do
+        log "$app: encrypted files changed, restarting sops-render@$app.service"
+        "$SYSTEMCTL" restart "sops-render@$app.service"
+    done
+
+    # Apps whose encrypted directory was removed: stop and delete plaintext.
+    for dir in "$OUT_ROOT"/*/; do
+        app=$(basename "$dir")
+        valid_app "$app" || continue
+        [[ -d $SRC_ROOT/$app ]] && continue
+        log "$app: encrypted secrets removed, cleaning up"
+        "$SYSTEMCTL" stop "sops-render@$app.service" || true
+        rm -rf -- "$OUT_ROOT/$app" "$STATE_ROOT/$app.sha256"
+    done
+
+    ((${#changed[@]})) || log "no changes"
+}
+
+usage() { echo "usage: sops-render render <app> | check <app> | sync" >&2; exit 2; }
+
+case ${1:-} in
+    render) [[ $# -eq 2 ]] || usage; cmd_render "$2" ;;
+    check)  [[ $# -eq 2 ]] || usage; cmd_check "$2" && log "$2: ok" ;;
+    sync)   [[ $# -eq 1 ]] || usage; cmd_sync ;;
+    *)      usage ;;
+esac

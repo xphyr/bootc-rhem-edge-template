@@ -1,0 +1,37 @@
+http:
+  routers:
+    grafana-http:
+      rule: "Host(`grafana.example.com`)"
+      entryPoints:
+        - "web"
+      middlewares:
+        - "secure-redirect"
+      service: "noop" # A dummy service is required, but it will never be reached due to the redirect
+
+    # 2. Catch HTTPS traffic on port 443 and forward to your backend app
+    grafana-https:
+      rule: "Host(`grafana.example.com`)"
+      entryPoints:
+        - "websecure"
+      service: "grafana-service"
+      tls:
+        certResolver: "letsencrypt"
+
+  middlewares:
+    # Define the redirect middleware rule
+    secure-redirect:
+      redirectScheme:
+        scheme: "https"
+        permanent: true
+
+  services:
+    grafana-service:
+      loadBalancer:
+        servers:
+          - url: http://monitor1.example.com:3000
+
+    # Dummy service required by the HTTP router syntax validation
+    noop:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1"

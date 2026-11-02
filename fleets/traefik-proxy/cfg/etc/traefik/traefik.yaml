@@ -1,0 +1,59 @@
+log:
+  level: INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: common  # common, json, logfmt
+  filePath: /var/log/traefik/traefik.log
+
+accesslog:
+  format: common  # common, json, logfmt
+  filePath: /var/log/traefik/access.log
+
+# Dashboard and API on the "traefik" entrypoint (:8080) without auth.
+# Keep port 8080 off the Internet, or secure the dashboard before exposing it.
+api:
+  insecure: true
+
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+    transport:
+      respondingTimeouts:
+        readTimeout: 60m
+        writeTimeout: 60m
+        idleTimeout: 60m
+  traefik:
+    address: ":8080"
+
+# Let's Encrypt certificates via the Cloudflare DNS-01 challenge. The API token
+# comes from CLOUDFLARE_DNS_API_TOKEN, rendered by sops-render@traefik-proxy
+# from cfg/etc/sops/traefik-proxy/cloudflare.sops.env.
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: admin@example.com     # <-- your email
+      storage: /etc/traefik/ssl-certs/acme.json
+      dnsChallenge:
+        provider: cloudflare
+        resolvers:
+          - "1.1.1.1:53"
+          - "8.8.8.8:53"
+        delayBeforeCheck: 5
+
+# Health check at http://<node>:8080/ping
+ping: {}
+
+# Metrics at http://<node>:8080/metrics
+metrics:
+  prometheus:
+    buckets:
+      - 0.1
+      - 0.3
+      - 1.2
+      - 5.0
+
+# Every file in /etc/traefik/dynamic is loaded and watched for changes.
+providers:
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true

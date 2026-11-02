@@ -1,0 +1,23 @@
+[Unit]
+Description=Render SOPS-encrypted secrets for %i into /run/sops-secrets/%i
+# App quadlets pull this in with:
+#   Requires=sops-render@<app>.service
+#   After=sops-render@<app>.service
+# Requires= means restarting this unit also restarts the app's containers,
+# and a failed render keeps them from starting.
+After=local-fs.target systemd-tmpfiles-setup.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=SOPS_AGE_KEY_FILE=/usr/lib/sops/age/keys.txt
+ExecStart=/usr/libexec/sops-render/sops-render render %i
+UMask=0077
+
+# Hardening: the renderer only reads /etc/sops and the key, and writes to /run.
+ProtectSystem=strict
+ReadWritePaths=/run/sops-secrets /run/sops-render
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes

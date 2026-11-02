@@ -1,0 +1,229 @@
+// 00-base.alloy – installed on EVERY host.
+// Alloy loads every *.alloy file in /etc/alloy/conf.d as one config, so
+// components defined here (loki.write.default, loki.relabel.journal_fields)
+// can be used by the per-role files next to it.
+//
+// This file ships all security-related logs and the host's system metrics.
+// Per-role files (e.g. quay.alloy) add the service logs for that kind of server.
+//
+// Labels on every line:
+//   host, job ("journal"/"audit"), category ("security"/"service"),
+//   unit, identifier, level
+
+// ---------------------------------------------------------------------------
+// Shared: where logs go
+// ---------------------------------------------------------------------------
+loki.write "default" {
+  endpoint {
+    url = "http://loki.example.com:3100/loki/api/v1/push"
+  }
+  external_labels = {
+    host = constants.hostname,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shared: journal field -> label mapping (used by every journal reader)
+// ---------------------------------------------------------------------------
+loki.relabel "journal_fields" {
+  forward_to = []
+
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+  // Rootless podman / user services: prefer the user unit over "user@1000.service"
+  rule {
+    source_labels = ["__journal__systemd_user_unit"]
+    regex         = "(.+)"
+    target_label  = "unit"
+  }
+  rule {
+    source_labels = ["__journal_syslog_identifier"]
+    target_label  = "identifier"
+  }
+  rule {
+    source_labels = ["__journal_priority_keyword"]
+    target_label  = "level"
+  }
+  // Helper labels for filtering; readers drop them before sending.
+  rule {
+    source_labels = ["__journal_syslog_facility"]
+    target_label  = "facility"
+  }
+  rule {
+    source_labels = ["__journal_priority"]
+    target_label  = "priority"
+  }
+  rule {
+    source_labels = ["__journal__transport"]
+    target_label  = "transport"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Journal: security events + system warnings/errors/crashes
+// ---------------------------------------------------------------------------
+loki.source.journal "system" {
+  max_age       = "12h"   // how far back to read on first start
+  relabel_rules = loki.relabel.journal_fields.rules
+  labels        = { job = "journal" }
+  forward_to    = [loki.relabel.journal_filter.receiver]
+}
+
+// Sorts every journal entry into a category, then drops the uncategorized.
+//   category="security" – auth, privilege, security daemons (any priority)
+//   category="system"   – anything else at warning or worse: unit failures,
+//                         errors, OOM kills, coredumps, kernel problems
+loki.relabel "journal_filter" {
+  forward_to = [loki.process.journal_levels.receiver]
+
+  // 1. Security, matched against "unit;identifier;facility;priority;transport":
+  //    security daemons by unit name
+  //    auth / account / privilege tools by syslog identifier
+  //    facility 4 (auth) or 10 (authpriv) – everything PAM logs
+  //    kernel messages at warning or worse (firewall drops, AVCs)
+  //    journald's audit transport, if enabled
+  rule {
+    source_labels = ["unit", "identifier", "facility", "priority", "transport"]
+    separator     = ";"
+    regex         = `(sshd|auditd|firewalld|sssd|polkit|systemd-logind|fail2ban|usbguard)[.]service;.*|[^;]*;(sshd|sshd-session|sudo|su|runuser|login|passwd|chpasswd|chage|useradd|userdel|usermod|groupadd|groupdel|groupmod|gpasswd|newgrp|unix_chkpwd|pkexec|polkitd|systemd-logind|sssd.*|setroubleshoot|audit|auditd|augenrules|firewalld|fail2ban.*|usbguard.*|aide|crontab);.*|[^;]*;[^;]*;(4|10);.*|[^;]*;kernel;[^;]*;[0-4];.*|.*;audit`
+    target_label  = "category"
+    replacement   = "security"
+  }
+
+  // 2. System problems: priority 0-4 (emerg, alert, crit, err, warning) from
+  //    anything not already tagged security. Covers "x.service: Failed with
+  //    result ...", OOM kills, systemd-coredump crash reports, driver errors.
+  rule {
+    source_labels = ["category", "priority"]
+    separator     = ";"
+    regex         = ";[0-4]"
+    target_label  = "category"
+    replacement   = "system"
+  }
+
+  // 3. Drop everything else, then remove the helper labels.
+  rule {
+    source_labels = ["category"]
+    regex         = "security|system"
+    action        = "keep"
+  }
+  rule {
+    regex  = "facility|priority|transport"
+    action = "labeldrop"
+  }
+}
+
+// Fix severity for apps that log everything to stderr (Prometheus, Grafana,
+// most Go programs, containers via conmon). The journal records all stderr
+// output as "err", so trust the app's own level= / "level": field instead,
+// and drop "system" lines that turn out to be info/debug.
+loki.process "journal_levels" {
+  forward_to = [loki.write.default.receiver]
+
+  // Selector and regex use the same pattern, so app_level is always found
+  // inside this block (an empty value would delete the level label).
+  stage.match {
+    selector = `{job="journal"} |~ "(?i)level\"? *[=:] *\"?[a-z]"`
+
+    // level=INFO  level="warn"  "level":"error"  "level": "debug"
+    stage.regex {
+      expression = `(?i)level"? *[=:] *"?(?P<app_level>[a-z]+)`
+    }
+    // Normalize to the journal's own names (err, warning, crit, ...);
+    // anything unrecognized is kept lowercased.
+    stage.template {
+      source   = "app_level"
+      template = `{{ $l := ToLower .Value }}{{ if or (eq $l "warn") (eq $l "warning") }}warning{{ else if or (eq $l "error") (eq $l "err") }}err{{ else if or (eq $l "fatal") (eq $l "panic") (eq $l "critical") (eq $l "crit") }}crit{{ else if or (eq $l "info") (eq $l "information") (eq $l "notice") }}info{{ else if or (eq $l "debug") (eq $l "trace") }}debug{{ else }}{{ $l }}{{ end }}`
+    }
+    stage.labels {
+      values = { level = "app_level" }
+    }
+  }
+
+  // "system" is for problems only.
+  stage.match {
+    selector            = `{category="system", level=~"info|debug"}`
+    action              = "drop"
+    drop_counter_reason = "app_level_not_a_problem"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// auditd log (SELinux AVCs, audit rules, logins)
+// auditd writes here instead of the journal, so read the file directly.
+// ---------------------------------------------------------------------------
+local.file_match "audit" {
+  path_targets = [{
+    __path__ = "/var/log/audit/audit.log",
+    job      = "audit",
+    category = "security",
+  }]
+}
+
+loki.source.file "audit" {
+  targets    = local.file_match.audit.targets
+  forward_to = [loki.write.default.receiver]
+}
+
+// ===========================================================================
+// Host metrics (node_exporter built into Alloy) -> Prometheus remote write
+// ===========================================================================
+
+// Shared: where metrics go. Prometheus must be started with
+// --web.enable-remote-write-receiver for this endpoint to accept writes.
+prometheus.remote_write "default" {
+  endpoint {
+    url = "http://prometheus.example.com:9090/api/v1/write"
+  }
+  external_labels = {
+    host = constants.hostname,   // same label as the logs, for jumping between them
+  }
+}
+
+prometheus.exporter.unix "node" {
+  // Defaults cover CPU, memory, disk, filesystem, network, load, pressure, etc.
+  // Add per-unit state (active/failed) so failed services show up as metrics.
+  enable_collectors  = ["systemd"]
+  // Drop collectors that are noisy or irrelevant on typical VMs/servers.
+  disable_collectors = ["ipvs", "btrfs", "infiniband", "fibrechannel", "tapestats", "zfs", "rapl", "nfsd"]
+
+  filesystem {
+    // Skip pseudo filesystems and container overlay mounts (podman/docker).
+    fs_types_exclude     = "^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs|tmpfs)$"
+    mount_points_exclude = "^/(dev|proc|run|sys|var/lib/containers/storage/.+|var/lib/docker/.+|home/[^/]+/[.]local/share/containers/.+)($|/)"
+  }
+
+  netclass {
+    ignored_devices = "^(veth.*|podman.*|cni.*|docker.*|br-.*|virbr.*|lo)$"
+  }
+
+  netdev {
+    device_exclude = "^(veth.*|podman.*|cni.*|docker.*|br-.*|virbr.*|lo)$"
+  }
+
+  systemd {
+    // Only real services and timers; skips the hundreds of mounts/scopes/slices.
+    unit_include = ".+[.](service|timer|socket)"
+  }
+}
+
+discovery.relabel "node" {
+  targets = prometheus.exporter.unix.node.targets
+
+  rule {
+    target_label = "job"
+    replacement  = "node"
+  }
+  rule {
+    target_label = "instance"
+    replacement  = constants.hostname
+  }
+}
+
+prometheus.scrape "node" {
+  targets         = discovery.relabel.node.output
+  scrape_interval = "15s"   // matches the Grafana Prometheus timeInterval
+  forward_to      = [prometheus.remote_write.default.receiver]
+}

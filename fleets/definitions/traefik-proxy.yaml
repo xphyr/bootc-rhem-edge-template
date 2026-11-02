@@ -1,0 +1,122 @@
+apiVersion: flightctl.io/v1beta1
+kind: Fleet
+metadata:
+  name: traefik-proxy
+spec:
+  selector:
+    matchLabels:
+      fleet: traefik-proxy
+  rolloutPolicy:
+    deviceSelection:
+      strategy: BatchSequence
+      sequence:
+        - limit: 1
+    successThreshold: 100%
+    defaultUpdateTimeout: 30m
+    disruptionBudget:
+      maxUnavailable: 1
+  template:
+    spec:
+      os:
+        image: registry.example.com/bootc/fedora44-edge-base:2026.11.2
+      config:
+        - name: timezone-config
+          inline:
+            - path: /etc/tmpfiles.d/timezone-link.conf
+              content: |
+                L+ /etc/localtime - - - - /usr/share/zoneinfo/America/New_York
+        - name: traefik-config
+          gitRef:
+            repository: bootc-edge-fleet
+            targetRevision: main
+            path: /fleets/traefik-proxy/cfg
+        # Per-host config layer: adds/overrides files for one device, picked by its alias label
+        - name: netbird-host-override
+          gitRef:
+            repository: bootc-edge-fleet
+            targetRevision: main
+            # Dynamically pulls the file matching the device name!
+            path: /fleets/traefik-proxy/hosts/{{ .metadata.labels.alias }}
+        - name: hostname-config
+          inline:
+            - path: /etc/hostname
+              content: "{{ .metadata.labels.alias }}"
+              mode: 0644
+      applications:
+        - name: netbird-app
+          appType: quadlet
+          inline:
+            - path: netbird.container
+              content: |
+                [Unit]
+                Description=NetBird Agent Service
+                After=network-online.target
+                Requires=sops-render@netbird.service netbird-sysctl.service
+                After=sops-render@netbird.service netbird-sysctl.service
+
+                [Container]
+                Image=docker.io/netbirdio/netbird:latest
+                ContainerName=netbird-agent
+                Network=host
+                # Grants full access to the host's /proc/sys filesystem
+                PodmanArgs=--privileged
+                #AddCapability=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_NET_RAW
+                EnvironmentFile=/run/sops-secrets/netbird/netbird.env
+                Volume=/var/lib/netbird:/var/lib/netbird:Z
+
+                [Service]
+                Restart=always
+
+                [Install]
+                WantedBy=multi-user.target
+        - name: traefik-app
+          appType: quadlet
+          inline:
+            - path: traefik.container
+              content: |-
+                [Unit]
+                Description=traefik application proxy
+                Documentation=https://traefik.io/traefik
+                Requires=sops-render@traefik-proxy.service
+                After=sops-render@traefik-proxy.service
+
+                [Container]
+                ContainerName=traefik
+                Image=docker.io/library/traefik:v3.7
+                Network=host
+
+                EnvironmentFile=/run/sops-secrets/traefik-proxy/cloudflare.env
+
+                Volume=/usr/share/zoneinfo/America/New_York:/etc/localtime:ro
+                Volume=/etc/traefik:/etc/traefik:Z
+                Volume=/var/log/traefik:/var/log/traefik:Z
+
+                # This is enabled by default
+                NoNewPrivileges=true
+                DropCapability=All
+                AddCapability=NET_BIND_SERVICE
+
+                # Add in health checks to ensure service is running
+                # Will use dig to check that the local server is responding
+                HealthCmd=traefik healthcheck
+                HealthInterval=30s
+                HealthTimeout=10s
+                HealthRetries=3
+                HealthStartPeriod=90s
+                ## Ensures systemd waits for health check
+                Notify=healthy
+
+                [Service]
+                Restart=always
+
+                [Install]
+                WantedBy=default.target
+              contentEncoding: plain
+      resources:
+        - monitorType: CPU
+          alertRules:
+            - severity: Warning
+              duration: 10m
+              percentage: 50
+              description: 'CPU load is above 50% for more than 10 minutes.'
+          samplingInterval: 30s
